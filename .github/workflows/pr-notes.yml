@@ -2,6 +2,7 @@ name: pr-notes
 
 # Leaves a comment with engineering notes on every PR.
 # Not a formal review — no approvals, no blockers, just notes.
+# One comment per PR: it is updated in place on each new push.
 
 on:
   pull_request:
@@ -10,26 +11,45 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write # PR comments are stored behind the issues API
+
+concurrency:
+  group: pr-notes-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
+  check:
+    name: Check configuration
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - name: Gate on API key
+        id: gate
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::OPENROUTER_API_KEY secret not set — skipping PR notes."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
   notes:
+    name: PR notes
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Skip if no API key configured
-        run: |
-          if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then
-            echo "::notice::OPENROUTER_API_KEY secret not set — skipping PR notes."
-            exit 0
-          fi
-
       - name: Collect diff
         run: |
           git fetch --no-tags origin "${{ github.base_ref }}"
-          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff || true
+          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
           # Cap the diff so token limits aren't blown on large PRs
           head -c 120000 pr.diff > pr.trimmed.diff
           if [ "$(wc -c < pr.diff)" -gt 120000 ]; then
@@ -67,7 +87,7 @@ jobs:
             model: $model,
             messages: [{ role: "user", content: $prompt }]
           }' > payload.json
-          status=$(curl -s -o response.json -w "%{http_code}" \
+          status=$(curl -sS -o response.json -w "%{http_code}" \
             https://openrouter.ai/api/v1/chat/completions \
             -H "Authorization: Bearer $OPENROUTER_API_KEY" \
             -H "Content-Type: application/json" \
@@ -87,4 +107,17 @@ jobs:
       - name: Post comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file notes.md
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          { echo '<!-- pr-notes -->'; cat notes.md; } > comment.md
+          ids=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- pr-notes -->")) | .id')
+          existing="${ids%%$'\n'*}"
+          if [ -n "$existing" ]; then
+            echo "Updating existing comment ${existing}"
+            jq -Rs '{body: .}' comment.md > comment.json
+            gh api --method PATCH "repos/${REPO}/issues/comments/${existing}" --input comment.json
+          else
+            gh pr comment "$PR_NUMBER" --body-file comment.md
+          fi
