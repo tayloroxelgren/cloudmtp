@@ -1,0 +1,90 @@
+name: pr-notes
+
+# Leaves a comment with engineering notes on every PR.
+# Not a formal review — no approvals, no blockers, just notes.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Skip if no API key configured
+        run: |
+          if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then
+            echo "::notice::OPENROUTER_API_KEY secret not set — skipping PR notes."
+            exit 0
+          fi
+
+      - name: Collect diff
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff || true
+          # Cap the diff so token limits aren't blown on large PRs
+          head -c 120000 pr.diff > pr.trimmed.diff
+          if [ "$(wc -c < pr.diff)" -gt 120000 ]; then
+            echo "... (diff truncated at 120000 bytes)" >> pr.trimmed.diff
+          fi
+
+      - name: Build prompt
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          {
+            echo "You are leaving brief engineering notes on a pull request."
+            echo "This is NOT a formal review: no approvals, no blockers, no line comments."
+            echo "Write a handful of concise bullet points on anything notable:"
+            echo "design choices, potential bugs, naming, missing tests, docs."
+            echo "If the diff is clean, say so briefly. No preamble, no closing summary."
+            echo ""
+            echo "## PR title"
+            echo "$PR_TITLE"
+            echo "## PR description"
+            echo "${PR_BODY:-none}"
+            echo "## Diff"
+            echo '```diff'
+            cat pr.trimmed.diff
+            echo '```'
+          } > prompt.txt
+
+      - name: Generate notes
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MODEL: z-ai/glm-4.6   # any OpenRouter model slug works
+        run: |
+          jq -n --arg model "$MODEL" --rawfile prompt prompt.txt '{
+            model: $model,
+            messages: [{ role: "user", content: $prompt }]
+          }' > payload.json
+          status=$(curl -s -o response.json -w "%{http_code}" \
+            https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data @payload.json)
+          if [ "$status" != "200" ]; then
+            echo "::error::LLM API request failed (HTTP $status)"
+            cat response.json
+            exit 1
+          fi
+          jq -r '.choices[0].message.content // empty' response.json > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::LLM returned empty content"
+            exit 1
+          fi
+          printf '\n---\n*Automated PR notes via `%s` on OpenRouter*\n' "$MODEL" >> notes.md
+
+      - name: Post comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file notes.md
