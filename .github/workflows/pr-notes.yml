@@ -61,7 +61,7 @@ jobs:
       - name: Generate notes
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          MODEL: z-ai/glm-4.6   # any OpenRouter model slug works
+          MODEL: ~z-ai/glm-flash-latest   # any OpenRouter model slug works
         run: |
           jq -n --arg model "$MODEL" --rawfile prompt prompt.txt '{
             model: $model,
